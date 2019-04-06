@@ -1,0 +1,24 @@
+Intro
+  We are Randy, Will, and Dan. We're sharing our analysis of NYC metro rider volume.
+Motivation
+
+Assumptions
+  Entries or Exits are more important
+  Hit up the places with the most traffic at that time is our goal
+
+Methods
+  Collected 2018 full 1 year of turnstile data.
+  Removed errors and outliers.
+  Consolidated into easier to understand time buckets.
+  Analyze weekdays vs saturdays vs sundays.
+  For each station and time block, we took the median value across the whole year.
+    This helps us eliminate errors in weeks
+
+Results
+  Heat maps of the top x stations.
+  Here are different heat maps if you consider the tourist index.
+
+Future work
+  Test stations and collect data to do better
+  Male to female ratios by station zip code
+  Group stations by geographical adjacency

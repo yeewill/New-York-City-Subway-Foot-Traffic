@@ -1,0 +1,164 @@
+import pandas as pd
+import requests
+from datetime import timedelta, date
+import pickle
+import numpy as np
+import seaborn as sns
+
+pd.set_option('display.max_rows',200)
+
+start = date(2018, 3, 1)
+end = date(2018, 6, 1)
+
+df = pd.DataFrame()
+
+for sdate in range((end - start).days):
+    fdate = (start + timedelta(sdate)).strftime('%y%m%d')
+    url = "http://web.mta.info/developers/data/nyct/turnstile/turnstile_" + fdate + ".txt"
+    try:
+        data = pd.read_csv(url)
+        data['file'] = fdate
+        df = df.append(data)
+    except:
+        pass
+
+df['date'] = pd.to_datetime(df.DATE)
+
+df['turnid'] = df['STATION'] + '/' + df['SCP'] + '/' + df['C/A']
+
+df = df.sort_values(['STATION','turnid','TIME'])
+
+df = df.rename(columns={ df.columns[10]: "EXITS" })
+
+# Remove readings at unusual times (that don't land on an even hour)
+df = df[df.TIME.str.contains(':00:00', regex=False)]
+
+pickle.dump(df, open('turnstiledata','wb'))
+
+df = pickle.load(open('turnstiledata','rb'))
+
+conditions = [  df.TIME.isin(['23:00:00','00:00:00','01:00:00','02:00:00']),
+                df.TIME.isin(['03:00:00','04:00:00','05:00:00','06:00:00']),
+                df.TIME.isin(['07:00:00','08:00:00','09:00:00','10:00:00']),
+                df.TIME.isin(['11:00:00','12:00:00','13:00:00','14:00:00']),
+                df.TIME.isin(['15:00:00','16:00:00','17:00:00','18:00:00']),
+                df.TIME.isin(['19:00:00','20:00:00','21:00:00','22:00:00'])]
+
+choices = ['00:00','04:00','08:00','12:00','16:00','20:00']
+
+df['time'] = np.select(conditions, choices, default=df.TIME)
+
+# # Check which turnstiles have the expected 42 audits
+# audit_counts = df.groupby(['turnid','date','TIME']).sum().groupby(['turnid']).count()
+# bad_turnids = audit_counts[audit_counts['ENTRIES']!=42].reset_index().turnid
+# len(bad_turnids)
+# good_turnids = audit_counts[audit_counts['ENTRIES']==42].reset_index().turnid
+# len(good_turnids)
+# pd.DataFrame(bad_turnids)
+# len(df)
+# irregular = df.merge(pd.DataFrame(bad_turnids),on='turnid')
+# irregular.groupby(['STATION','turnid','date','TIME']).sum()
+
+# Sum up for the different DESC, for each turnstile/timeblock
+
+df = df.groupby(['STATION','turnid','date','time'], as_index=False).sum()
+
+df['dayofweek'] = df.date.dt.day_name()
+#df['daytype'] = np.where(df['dayofweek'].isin(['Sunday','Saturday']), 'Weekend', 'Weekday')
+
+df['daytype'] = np.select([df.dayofweek.isin(['Monday','Tuesday','Wednesday','Thursday','Friday'])], ['Weekday'], default=df.dayofweek)
+
+# Create the net entries as differene in this row from following row entries
+df['entries'] = df.ENTRIES.shift(-1) - df.ENTRIES
+df['exits'] = df.EXITS.shift(-1) - df.EXITS
+df['passages'] = df.entries + df.exits
+
+# Delete last row for each turnstile, for which we can't calculate the net # entries
+df = df.groupby(['turnid'], as_index=False).apply(lambda x: x.iloc[:-1])
+#df[df.STATION.str.contains('LEXINGTON')][df.dayofweek.str.contains('Sunday')]
+
+pickle.dump(df, open('turnstiledata2','wb'))
+
+df = pickle.load(open('turnstiledata2','rb'))
+
+# for now remove fulton which is a suspicious outlier
+df = df[df.STATION != 'FULTON ST']
+
+# switch passage counts to hourly rates
+df['passages'] = df['passages']/4
+
+# Create touristy index, as ratio of weekend traffic over weekday traffic, merge touristyindices back into df
+touristy = df.groupby(['STATION','daytype'],as_index=False).mean().pivot(index='STATION',columns='daytype',values='passages').reset_index()
+touristy['Weekend'] = ( touristy.Saturday + touristy.Sunday )/ 2
+touristy['tourist_index'] = touristy.Saturday / touristy.Weekday
+touristy = touristy[['STATION','tourist_index']]
+# some upper and lower bounds on touristy score, so factor of 4 max
+touristy['tourist_index'] = touristy['tourist_index'].where(touristy['tourist_index'] >= .25, .25)
+touristy['tourist_index'] = touristy['tourist_index'].where(touristy['tourist_index'] <= 2, 2)
+
+df = df.merge(touristy,on='STATION')
+# Create passages count adjusted by touristy index
+df['passages_t'] = df.passages / df.tourist_index
+
+# Sum up turnstiles into stations
+df = df.groupby(['STATION','date','daytype','time'], as_index=False).sum()
+
+# Eliminate negatives
+df = df[df.entries>0]
+df = df[df.exits>0]
+
+# Now medians of 52 weeks for each daytype
+df = df.groupby(['STATION','daytype','time']).agg(['median','count'],as_index=False)
+df.columns = df.columns.droplevel(1)
+df.columns = ['ENTRIES','ENTRIES_c','EXITS','EXITS_c','entries','entries_c','exits','exits_c','passages','passages_c','tourist_index','tourist_index_c','passages_t','passages_t_c']
+
+# require that station/daytype/timeblock to have had at least 3 entries
+df = df[df.passages_c >=5]
+
+# Create list (series) of 20 most frequented stations
+findtop = df.reset_index().groupby(['STATION'],as_index=False).mean()
+top_6 = findtop.sort_values('passages',ascending=False).STATION[0:8]
+top_6_t = findtop.sort_values('passages_t',ascending=False).STATION[0:8]
+
+df_t = df[['entries','exits','passages_t']].sort_values(['passages_t'],ascending=False).reset_index()
+df = df[['entries','exits','passages']].sort_values(['passages'],ascending=False).reset_index()
+df_top6 = df[df.STATION.isin(top_6)].groupby(['STATION','daytype','time']).sum().reset_index()
+df_top6_t = df_t[df_t.STATION.isin(top_6_t)].groupby(['STATION','daytype','time']).sum().reset_index()
+
+df_top6
+weekdays = df_top6[df_top6.daytype=='Weekday']
+weekdays = weekdays[['time','STATION','passages']]
+weekdays = weekdays.pivot(index='STATION',columns='time',values='passages')
+
+saturdays = df_top6[df_top6.daytype=='Saturday']
+saturdays = saturdays[['time','STATION','passages']]
+saturdays = saturdays.pivot(index='STATION',columns='time',values='passages')
+
+sundays = df_top6[df_top6.daytype=='Sunday']
+sundays = sundays[['time','STATION','passages']]
+sundays = sundays.pivot(index='STATION',columns='time',values='passages')
+
+weekdays_t = df_top6_t[df_top6_t.daytype=='Weekday']
+weekdays_t = weekdays_t[['time','STATION','passages_t']]
+weekdays_t = weekdays_t.pivot(index='STATION',columns='time',values='passages_t')
+
+saturdays_t = df_top6_t[df_top6_t.daytype=='Saturday']
+saturdays_t = saturdays_t[['time','STATION','passages_t']]
+saturdays_t = saturdays_t.pivot(index='STATION',columns='time',values='passages_t')
+
+sundays_t = df_top6_t[df_top6_t.daytype=='Sunday']
+sundays_t = sundays_t[['time','STATION','passages_t']]
+sundays_t = sundays_t.pivot(index='STATION',columns='time',values='passages_t')
+weekdays
+
+import matplotlib.pyplot as plt
+plt.figure(figsize=(10, 8))
+plt.show()
+
+sns.heatmap(weekdays,cmap="Greens",annot=False).set_title('WEEKDAYS').get_figure().savefig('thisissodumb');
+
+sns.heatmap(weekdays_t,cmap="Greens",annot=False,cbar=False).set_title('WEEKDAYS - TOURIST ADJUSTED');
+sns.heatmap(saturdays,cmap="Purples",annot=False).set_title('SATURDAYS');
+sns.heatmap(saturdays_t,cmap="Purples",annot=False,cbar=False).set_title('SATURDAYS - TOURIST ADJUSTED');
+sns.heatmap(sundays,cmap="Blues",annot=False).set_title('SUNDAYS');
+sns.heatmap(sundays_t,cmap="Blues",annot=False,cbar=False).set_title('SUNDAYS - TOURIST ADJUSTED');
